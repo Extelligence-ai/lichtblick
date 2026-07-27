@@ -8,6 +8,7 @@
 import { useMemo } from "react";
 
 import { CurrentLayoutLocalStorageSyncAdapter } from "@lichtblick/suite-base/components/CurrentLayoutLocalStorageSyncAdapter";
+import { EmbedBridgeAdapter } from "@lichtblick/suite-base/components/EmbedBridgeAdapter";
 import { URLStateSyncAdapter } from "@lichtblick/suite-base/components/URLStateSyncAdapter";
 import { useAppContext } from "@lichtblick/suite-base/context/AppContext";
 
@@ -23,6 +24,7 @@ export function SyncAdapters(): React.JSX.Element {
     return (
       <>
         <URLStateSyncAdapter />
+        <EmbedBridgeAdapter />
         <CurrentLayoutLocalStorageSyncAdapter />
       </>
     );
