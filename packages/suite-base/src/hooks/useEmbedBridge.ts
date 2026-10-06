@@ -15,165 +15,158 @@ import {
   useMessagePipeline,
 } from "@lichtblick/suite-base/components/MessagePipeline";
 
-const PROTOCOL_VERSION = 1;
-const EMIT_INTERVAL_MS = 66;
-const HELLO_RETRY_INTERVAL_MS = 1000;
-const HELLO_MAX_ATTEMPTS = 10;
+import { applyEmbedCommand, embedAddress } from "./embedControl";
 
 const selectSeek = (ctx: MessagePipelineContext) => ctx.seekPlayback;
-const selectActiveData = (ctx: MessagePipelineContext) =>
-  ctx.playerState.activeData;
+const selectPlay = (ctx: MessagePipelineContext) => ctx.startPlayback;
+const selectPause = (ctx: MessagePipelineContext) => ctx.pausePlayback;
+const selectActive = (ctx: MessagePipelineContext) => ctx.playerState.activeData;
 
-type ActiveData = NonNullable<ReturnType<typeof selectActiveData>>;
-
-function postTime(data: ActiveData): void {
-  try {
-    window.parent.postMessage(
-      {
-        lichtblick: "time",
-        current: data.currentTime,
-        start: data.startTime,
-        end: data.endTime,
-        playing: data.isPlaying,
-      },
-      window.location.origin,
-    );
-  } catch {
-    // Detached/foreign parent — ignore.
-  }
-}
-
-/**
- * Matcha embed bridge: when running inside a same-origin iframe, mirrors
- * playback time to the parent and accepts seek commands from it.
- * Protocol: {lichtblick:'hello'|'time'|'seek', ...} — see Matcha
- * docs/superpowers/specs/2026-07-26-scrub-lock-design.md.
- */
+/** Legacy same-origin seeks, plus opt-in protocol 2 for an isolated Matcha viewer. */
 export function useEmbedBridge(): void {
-  const seekPlayback = useMessagePipeline(selectSeek);
-  const activeData = useMessagePipeline(selectActiveData);
-  const lastEmit = useRef(0);
-  const latestActiveData = useRef(activeData);
-  const flushTimeout = useRef<ReturnType<typeof setTimeout> | undefined>(
-    undefined,
-  );
-  const receivedParentMessage = useRef(false);
-
-  const embedded = typeof window !== "undefined" && window.parent !== window;
-
-  // Announce ourselves immediately, then retry until the parent responds
-  // (its listener may attach after our first hello fires) or we give up.
+  const seek = useMessagePipeline(selectSeek);
+  const play = useMessagePipeline(selectPlay);
+  const pause = useMessagePipeline(selectPause);
+  const active = useMessagePipeline(selectActive);
+  const latest = useRef({ active, seek, play, pause });
+  latest.current = { active, seek, play, pause };
   useEffect(() => {
-    if (!embedded) {
+    if (window.parent === window) {
       return;
     }
-    const sendHello = () => {
-      try {
-        window.parent.postMessage(
-          { lichtblick: "hello", protocol: PROTOCOL_VERSION },
-          window.location.origin,
-        );
-      } catch {
-        // Cross-origin parent: not our embed, stay silent.
+    const address = embedAddress(window.location.search, window.location.origin);
+    let interaction = 0;
+    // Bound memory; parent sends commands in order, never retransmits an old ID.
+    const handled = new Set<string>();
+    const post = (value: Record<string, unknown>) => {
+      window.parent.postMessage(
+        {
+          ...value,
+          ...(address.channel ? { protocol: 2, channel: address.channel, interaction } : {}),
+        },
+        address.origin,
+      );
+    };
+    const state = () => {
+      const data = latest.current.active;
+      if (data) {
+        post({
+          lichtblick: "time",
+          current: data.currentTime,
+          start: data.startTime,
+          end: data.endTime,
+          playing: data.isPlaying,
+          ready: !!latest.current.seek,
+        });
       }
     };
-
-    sendHello();
-
-    let attempts = 1;
-    const interval = setInterval(() => {
-      if (receivedParentMessage.current || attempts >= HELLO_MAX_ATTEMPTS) {
-        clearInterval(interval);
-        return;
-      }
-      attempts += 1;
-      sendHello();
-    }, HELLO_RETRY_INTERVAL_MS);
-
-    return () => {
-      clearInterval(interval);
+    const hello = () => {
+      post({ lichtblick: "hello", protocol: address.channel ? 2 : 1 });
     };
-  }, [embedded]);
-
-  // Accept seeks from the parent.
-  useEffect(() => {
-    if (!embedded || !seekPlayback) {
-      return;
-    }
     const onMessage = (event: MessageEvent) => {
-      if (event.origin !== window.location.origin) {
+      if (event.source !== window.parent || event.origin !== address.origin) {
         return;
       }
-      const data = event.data as {
-        lichtblick?: string;
-        time?: { sec: number; nsec: number };
-      } | null;
-      if (data?.lichtblick == undefined) {
+      const data: unknown = event.data;
+      if (data == undefined || typeof data !== "object") {
         return;
       }
-      receivedParentMessage.current = true;
-      if (
-        data.lichtblick === "seek" &&
-        data.time &&
-        Number.isFinite(data.time.sec) &&
-        Number.isFinite(data.time.nsec)
-      ) {
+      const command = data as Record<string, unknown>;
+      if (address.channel) {
+        if (command.protocol !== 2 || command.channel !== address.channel) {
+          return;
+        }
+        if (command.lichtblick === "hello") {
+          hello();
+          state();
+          return;
+        }
+        if (
+          command.lichtblick !== "command" ||
+          typeof command.id !== "string" ||
+          command.id.length > 128
+        ) {
+          return;
+        }
+        if (handled.has(command.id)) {
+          return;
+        }
+        handled.add(command.id);
+        if (handled.size > 256) {
+          handled.delete(handled.values().next().value!);
+        }
         try {
-          seekPlayback(data.time);
-        } catch {
-          // Player rejected the seek (e.g. not ready) — ignore, keep bridge alive.
+          if (command.interaction !== interaction) {
+            throw new Error("Manual controls took precedence");
+          }
+          const current = latest.current;
+          if (!current.active) {
+            throw new Error("Recording is not ready");
+          }
+          applyEmbedCommand(command, {
+            start: current.active.startTime,
+            end: current.active.endTime,
+            play: current.play,
+            pause: current.pause,
+            seek: current.seek,
+          });
+          post({ lichtblick: "ack", id: command.id, ok: true });
+        } catch (error) {
+          post({
+            lichtblick: "ack",
+            id: command.id,
+            ok: false,
+            message: error instanceof Error ? error.message : "Playback command was rejected",
+          });
+        }
+        return;
+      }
+      if (
+        command.lichtblick === "seek" &&
+        command.time != undefined &&
+        typeof command.time === "object"
+      ) {
+        const time = command.time as { sec?: unknown; nsec?: unknown };
+        if (
+          typeof time.sec === "number" &&
+          Number.isFinite(time.sec) &&
+          typeof time.nsec === "number" &&
+          Number.isFinite(time.nsec)
+        ) {
+          try {
+            latest.current.seek?.({ sec: time.sec, nsec: time.nsec });
+          } catch {
+            /* Player not ready. */
+          }
         }
       }
     };
-    window.addEventListener("message", onMessage);
-    return () => {
-      window.removeEventListener("message", onMessage);
+    const manual = (event: Event) => {
+      if (!address.channel || !event.isTrusted) {
+        return;
+      }
+      interaction++;
+      post({ lichtblick: "manual" });
     };
-  }, [embedded, seekPlayback]);
-
-  // Mirror playback time to the parent (throttled, leading-edge, with a
-  // trailing flush so the final settled position after a burst is never lost).
-  useEffect(() => {
-    latestActiveData.current = activeData;
-    if (!embedded || !activeData) {
-      return;
-    }
-
-    const now = Date.now();
-    const elapsed = now - lastEmit.current;
-    if (elapsed >= EMIT_INTERVAL_MS) {
-      if (flushTimeout.current != undefined) {
-        clearTimeout(flushTimeout.current);
-        flushTimeout.current = undefined;
+    window.addEventListener("message", onMessage);
+    window.addEventListener("pointerdown", manual, true);
+    window.addEventListener("keydown", manual, true);
+    hello();
+    // State uses the latest player snapshot; keeps paused / freshly loaded embeds discoverable.
+    const timer = setInterval(state, 100);
+    let attempts = 0;
+    const handshake = setInterval(() => {
+      if (++attempts >= 10) {
+        clearInterval(handshake);
       }
-      lastEmit.current = now;
-      postTime(activeData);
-      return;
-    }
-
-    // Suppressed by throttle: schedule (or reschedule) a trailing flush that
-    // posts whatever the latest snapshot is once the interval elapses.
-    if (flushTimeout.current != undefined) {
-      clearTimeout(flushTimeout.current);
-    }
-    const remaining = EMIT_INTERVAL_MS - elapsed;
-    flushTimeout.current = setTimeout(() => {
-      flushTimeout.current = undefined;
-      const latest = latestActiveData.current;
-      if (latest) {
-        lastEmit.current = Date.now();
-        postTime(latest);
-      }
-    }, remaining);
-  }, [embedded, activeData]);
-
-  // Clear any pending trailing flush on unmount.
-  useEffect(() => {
+      hello();
+    }, 1000);
     return () => {
-      if (flushTimeout.current != undefined) {
-        clearTimeout(flushTimeout.current);
-        flushTimeout.current = undefined;
-      }
+      clearInterval(timer);
+      clearInterval(handshake);
+      window.removeEventListener("message", onMessage);
+      window.removeEventListener("pointerdown", manual, true);
+      window.removeEventListener("keydown", manual, true);
     };
   }, []);
 }
